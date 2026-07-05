@@ -1,60 +1,88 @@
-import { openDB, IDBPDatabase } from 'idb';
-
-const DB_NAME = 'fonts_studio_pro_db';
-const STORE_NAME = 'user_fonts';
+import { supabase } from './supabaseClient';
 
 export interface StoredFont {
-  id: string;      // ID único (ej: font-12345)
-  name: string;    // Nombre amigable (ej: "Mi Fuente Pro")
-  data: ArrayBuffer; // El archivo real en binario
+  id: string;      // ID de la fila en la tabla 'fonts'
+  name: string;    // Nombre amigable
+  url: string;     // URL pública o firmada del archivo en Storage
   fileName: string; // Nombre del archivo original
-  createdAt: number;
+  createdAt: string;
 }
 
 /**
- * Inicializa y abre la conexión con la base de datos local del navegador
+ * Guarda una nueva fuente en Supabase Storage y registra los metadatos en la DB
  */
-async function getDB(): Promise<IDBPDatabase> {
-  return openDB(DB_NAME, 1, {
-    upgrade(db) {
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        db.createObjectStore(STORE_NAME, { keyPath: 'id' });
-      }
-    },
-  });
-}
+export async function saveFont(file: File, userId: string): Promise<StoredFont> {
+  // 1. Subir el archivo al bucket 'fonts' en una carpeta propia del usuario
+  const filePath = `${userId}/${Date.now()}-${file.name}`;
+  const { data: storageData, error: storageError } = await supabase.storage
+    .from('fonts')
+    .upload(filePath, file);
 
-/**
- * Guarda una nueva fuente en IndexedDB
- */
-export async function saveFont(file: File): Promise<StoredFont> {
-  const db = await getDB();
-  const arrayBuffer = await file.arrayBuffer();
-  
-  const newFont: StoredFont = {
-    id: `font-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
-    name: file.name.replace(/\.[^/.]+$/, ""), // Quita la extensión
-    data: arrayBuffer,
-    fileName: file.name,
-    createdAt: Date.now(),
+  if (storageError) throw storageError;
+
+  // 2. Obtener la URL pública del archivo
+  const { data: { publicUrl } } = supabase.storage
+    .from('fonts')
+    .getPublicUrl(filePath);
+
+  // 3. Guardar metadatos en la tabla 'fonts'
+  const { data: fontData, error: dbError } = await supabase
+    .from('fonts')
+    .insert({
+      user_id: userId,
+      name: file.name.replace(/\.[^/.]+$/, ""),
+      file_path: filePath,
+      file_name: file.name,
+    })
+    .select()
+    .single();
+
+  if (dbError) throw dbError;
+
+  return {
+    id: fontData.id,
+    name: fontData.name,
+    url: publicUrl,
+    fileName: fontData.file_name,
+    createdAt: fontData.created_at,
   };
-
-  await db.put(STORE_NAME, newFont);
-  return newFont;
 }
 
 /**
- * Recupera todas las fuentes almacenadas localmente
+ * Recupera todas las fuentes del usuario autenticado
  */
-export async function getAllFonts(): Promise<StoredFont[]> {
-  const db = await getDB();
-  return db.getAll(STORE_NAME);
+export async function getAllFonts(userId: string): Promise<StoredFont[]> {
+  const { data, error } = await supabase
+    .from('fonts')
+    .select('*')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false });
+
+  if (error) throw error;
+
+  // Convertir paths en URLs públicas
+  return data.map(font => ({
+    ...font,
+    url: supabase.storage.from('fonts').getPublicUrl(font.file_path).data.publicUrl
+  }));
 }
 
 /**
- * Elimina una fuente por su ID
+ * Elimina una fuente de la DB y del Storage
  */
-export async function deleteFont(id: string): Promise<void> {
-  const db = await getDB();
-  await db.delete(STORE_NAME, id);
+export async function deleteFont(fontId: string, filePath: string): Promise<void> {
+  // 1. Eliminar de la DB
+  const { error: dbError } = await supabase
+    .from('fonts')
+    .delete()
+    .eq('id', fontId);
+
+  if (dbError) throw dbError;
+
+  // 2. Eliminar del Storage
+  const { error: storageError } = await supabase.storage
+    .from('fonts')
+    .remove([filePath]);
+
+  if (storageError) throw storageError;
 }
